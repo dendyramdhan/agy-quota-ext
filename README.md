@@ -1,6 +1,6 @@
 # ⚡ Antigravity Quota Manager
 
-[![Version](https://img.shields.io/badge/version-3.3.0-blue.svg)](https://github.com/dendyramdhan/agy-quota-ext)
+[![Version](https://img.shields.io/badge/version-3.4.0-blue.svg)](https://github.com/dendyramdhan/agy-quota-ext)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 An elegant, real-time AI quota monitor and multi-account manager extension for **Antigravity IDE**.

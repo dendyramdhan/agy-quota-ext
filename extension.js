@@ -133,6 +133,8 @@ class LanguageServerClient {
             const ps = execSync('ps aux', { encoding: 'utf8', timeout: 3000 });
             const lines = ps.split('\n');
 
+            // Collect candidate LS processes, preferring the main (non-LSP) one
+            const candidates = [];
             for (const line of lines) {
                 if (line.includes('language_server') && line.includes('--csrf_token')) {
                     const pidMatch = line.match(/^\S+\s+(\d+)/);
@@ -141,30 +143,38 @@ class LanguageServerClient {
 
                     const pid = pidMatch[1];
                     const csrf = csrfMatch[1];
+                    const hasLsp = line.includes('--enable_lsp');
 
-                    // Candidate ports from lsof
-                    const ports = [];
-                    try {
-                        const lsof = execSync(`lsof -a -nP -iTCP -sTCP:LISTEN -p ${pid}`, { encoding: 'utf8', timeout: 2000 });
-                        const listenMatches = lsof.matchAll(/:([0-9]+)\s+\(LISTEN\)/g);
-                        for (const lm of listenMatches) {
-                            ports.push(parseInt(lm[1], 10));
-                        }
-                    } catch (e) {}
+                    candidates.push({ pid, csrf, hasLsp, line });
+                }
+            }
 
-                    // Candidate ports from command line
-                    const portMatches = line.matchAll(/--(?:https_server_port|extension_server_port|lsp_port)\s+([0-9]+)/g);
-                    for (const m of portMatches) ports.push(parseInt(m[1], 10));
+            // Sort: prefer non-LSP processes first (they are the main extension server)
+            candidates.sort((a, b) => (a.hasLsp ? 1 : 0) - (b.hasLsp ? 1 : 0));
 
-                    const uniquePorts = [...new Set(ports)];
-                    for (const p of uniquePorts) {
-                        const ok = await this._testPort(p, csrf);
-                        if (ok) {
-                            this.port = p;
-                            this.csrfToken = csrf;
-                            this.lastChecked = Date.now();
-                            return true;
-                        }
+            for (const cand of candidates) {
+                // Candidate ports from lsof
+                const ports = [];
+                try {
+                    const lsof = execSync(`lsof -a -nP -iTCP -sTCP:LISTEN -p ${cand.pid}`, { encoding: 'utf8', timeout: 2000 });
+                    const listenMatches = lsof.matchAll(/:([0-9]+)\s+\(LISTEN\)/g);
+                    for (const lm of listenMatches) {
+                        ports.push(parseInt(lm[1], 10));
+                    }
+                } catch (e) {}
+
+                // Candidate ports from command line
+                const portMatches = cand.line.matchAll(/--(?:https_server_port|extension_server_port|lsp_port)\s+([0-9]+)/g);
+                for (const m of portMatches) ports.push(parseInt(m[1], 10));
+
+                const uniquePorts = [...new Set(ports)];
+                for (const p of uniquePorts) {
+                    const ok = await this._testPort(p, cand.csrf);
+                    if (ok) {
+                        this.port = p;
+                        this.csrfToken = cand.csrf;
+                        this.lastChecked = Date.now();
+                        return true;
                     }
                 }
             }
@@ -255,30 +265,51 @@ function parseStatusResponse(data) {
     const geminiConfigs = clientConfigs.filter(c => (c.label || '').includes('Gemini'));
     const claudeConfigs = clientConfigs.filter(c => (c.label || '').includes('Claude') || (c.label || '').includes('GPT'));
 
-    // --- 1. GEMINI MODELS ---
-    const gQuota = geminiConfigs[0]?.quotaInfo || {};
-    const gFraction = gQuota.remainingFraction;
-    const gemini5Hour = (typeof gFraction === 'number' && gFraction > 0.01) ? Math.round(gFraction * 100) : 0;
-    const gemini5HourReset = gQuota.resetTime || null;
+    // --- Helper: get pool's min remaining fraction (all models in the pool share the same pool quota) ---
+    function getPoolQuota(configs) {
+        let minFraction = null;
+        let resetTime = null;
+        for (const c of configs) {
+            const qi = c.quotaInfo || {};
+            if (typeof qi.remainingFraction === 'number') {
+                if (minFraction === null || qi.remainingFraction < minFraction) {
+                    minFraction = qi.remainingFraction;
+                }
+            }
+            if (qi.resetTime && !resetTime) {
+                resetTime = qi.resetTime;
+            }
+        }
+        return { fraction: minFraction, resetTime };
+    }
 
-    // Weekly cycle (approx 7-day rolling cycle)
+    // --- 1. GEMINI MODELS ---
+    const gPool = getPoolQuota(geminiConfigs);
+    const gFraction = gPool.fraction;
+    const gemini5Hour = (typeof gFraction === 'number' && gFraction > 0.005) ? Math.round(gFraction * 100) : 0;
+    const gemini5HourReset = gPool.resetTime || null;
+
+    // Weekly cycle: compute next Sunday 17:30 local time as approximate reset
     const now = new Date();
     const dayOfWeek = now.getDay();
     const daysUntilSunday = (7 - dayOfWeek) % 7 || 7;
     const weeklyResetDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysUntilSunday, 17, 30, 0);
     const weeklyResetIso = weeklyResetDate.toISOString();
 
-    const geminiWeekly = 95;
+    // Weekly: estimate from 5-hour fraction. If 5-hour is high, weekly should be at least as high.
+    // Weekly degrades slower than 5-hour. Approximate: weekly ≈ max(5h%, estimated_weekly).
+    // Since LS doesn't provide weekly data, we estimate conservatively.
+    const geminiWeekly = gemini5Hour === 0 ? Math.max(0, 65) : Math.max(gemini5Hour, Math.min(100, gemini5Hour + 10));
 
     // --- 2. CLAUDE AND GPT MODELS ---
-    const cQuota = claudeConfigs[0]?.quotaInfo || {};
-    const cFraction = cQuota.remainingFraction;
-    // When remainingFraction is <= 0.01 or null, the 5-hour limit is hit (0%)
-    const claude5Hour = (typeof cFraction === 'number' && cFraction > 0.01) ? Math.round(cFraction * 100) : 0;
-    const claude5HourReset = cQuota.resetTime || null;
+    const cPool = getPoolQuota(claudeConfigs);
+    const cFraction = cPool.fraction;
+    // When remainingFraction is <= 0.005 or null, the 5-hour limit is hit (0%)
+    const claude5Hour = (typeof cFraction === 'number' && cFraction > 0.005) ? Math.round(cFraction * 100) : 0;
+    const claude5HourReset = cPool.resetTime || null;
 
-    // Weekly limit for Claude is 65% when 5-hour limit is hit
-    const claudeWeekly = claude5Hour === 0 ? 65 : Math.max(claude5Hour, 80);
+    // Weekly limit for Claude: estimate similarly
+    const claudeWeekly = claude5Hour === 0 ? 65 : Math.max(claude5Hour, Math.min(100, claude5Hour + 10));
 
     return {
         user: { name, email, plan },
