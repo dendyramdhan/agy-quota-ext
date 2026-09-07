@@ -485,6 +485,7 @@ function activate(context) {
                     return;
                 }
 
+                const aPro = isProPlan(plan);
                 accounts.push({
                     email,
                     name,
@@ -493,11 +494,11 @@ function activate(context) {
                     quota: {
                         gemini: {
                             weekly: { percentage: 100, resetTime: new Date(Date.now() + 6 * 86400000).toISOString() },
-                            fiveHour: { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() }
+                            fiveHour: aPro ? { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() } : null
                         },
                         claude: {
                             weekly: { percentage: 100, resetTime: new Date(Date.now() + 6 * 86400000).toISOString(), fiveHourLimited: false },
-                            fiveHour: { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() }
+                            fiveHour: aPro ? { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() } : null
                         }
                     }
                 });
@@ -1320,10 +1321,10 @@ class QuotaDashboardProvider {
                     </div>
                 </div>
                 <div class="limit-gauge-col">
-                    <span class="limit-percentage" id="geminiWeeklyPct">95%</span>
+                    <span class="limit-percentage dim" id="geminiWeeklyPct">--%</span>
                     <svg class="gauge-svg" viewBox="0 0 36 36">
                         <path class="gauge-track" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
-                        <path class="gauge-circle" id="geminiWeeklyCircle" stroke-dasharray="100, 100" stroke-dashoffset="5" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                        <path class="gauge-circle" id="geminiWeeklyCircle" stroke-dasharray="100, 100" stroke-dashoffset="100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
                     </svg>
                 </div>
             </div>
@@ -1342,10 +1343,10 @@ class QuotaDashboardProvider {
                     </div>
                 </div>
                 <div class="limit-gauge-col">
-                    <span class="limit-percentage" id="gemini5HourPct">74%</span>
+                    <span class="limit-percentage dim" id="gemini5HourPct">--%</span>
                     <svg class="gauge-svg" viewBox="0 0 36 36">
                         <path class="gauge-track" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
-                        <path class="gauge-circle" id="gemini5HourCircle" stroke-dasharray="100, 100" stroke-dashoffset="26" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                        <path class="gauge-circle" id="gemini5HourCircle" stroke-dasharray="100, 100" stroke-dashoffset="100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
                     </svg>
                 </div>
             </div>
@@ -1384,10 +1385,10 @@ class QuotaDashboardProvider {
                     </div>
                 </div>
                 <div class="limit-gauge-col">
-                    <span class="limit-percentage" id="claudeWeeklyPct">65%</span>
+                    <span class="limit-percentage dim" id="claudeWeeklyPct">--%</span>
                     <svg class="gauge-svg" viewBox="0 0 36 36">
                         <path class="gauge-track" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
-                        <path class="gauge-circle" id="claudeWeeklyCircle" stroke-dasharray="100, 100" stroke-dashoffset="35" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                        <path class="gauge-circle" id="claudeWeeklyCircle" stroke-dasharray="100, 100" stroke-dashoffset="100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
                     </svg>
                 </div>
             </div>
