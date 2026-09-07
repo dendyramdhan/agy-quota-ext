@@ -410,123 +410,6 @@ function activate(context) {
         }),
         vscode.commands.registerCommand('agyQuota.openDashboard', () => {
             vscode.commands.executeCommand('workbench.view.extension.agy-quota');
-        }),
-        vscode.commands.registerCommand('agyQuota.switchAccount', async () => {
-            const accounts = getSavedAccounts();
-            if (accounts.length <= 1) {
-                const opt = await vscode.window.showInformationMessage(
-                    `Only 1 account found (${accounts[0]?.email || 'None'}). Would you like to add another Google account?`,
-                    'Add Google Account', 'Cancel'
-                );
-                if (opt === 'Add Google Account') {
-                    vscode.commands.executeCommand('agyQuota.addAccount');
-                }
-                return;
-            }
-            const items = accounts.map(a => ({
-                label: `$(account) ${a.name || a.email}`,
-                description: a.email,
-                detail: `Plan: ${a.plan || 'Pro'} • Last active: ${new Date(a.lastSync).toLocaleDateString()}`
-            }));
-            const selected = await vscode.window.showQuickPick(items, {
-                placeHolder: 'Select Google account to switch to'
-            });
-            if (selected && selected.description) {
-                try {
-                    switchAccountBlobs(selected.description);
-                    const rel = await vscode.window.showInformationMessage(
-                        `Switched to ${selected.description}. Reload window to apply changes.`,
-                        'Reload Now'
-                    );
-                    if (rel === 'Reload Now') {
-                        vscode.commands.executeCommand('workbench.action.reloadWindow');
-                    }
-                } catch (err) {
-                    vscode.window.showErrorMessage(`Failed to switch account: ${err.message}`);
-                }
-            }
-        }),
-        vscode.commands.registerCommand('agyQuota.addAccount', async () => {
-            const pick = await vscode.window.showQuickPick([
-                {
-                    label: '$(mail) Tambah Akun Google (Cepat)',
-                    description: 'Ketik email & nama akun untuk langsung memantau kuota di dropdown',
-                    action: 'quick'
-                },
-                {
-                    label: '$(globe) Hubungkan via Google Sign-In Browser',
-                    description: 'Login resmi di browser untuk menyimpan token otentikasi Antigravity',
-                    action: 'browser'
-                }
-            ], { placeHolder: 'Pilih metode penambahan akun Google (hingga 6 akun):' });
-
-            if (!pick) return;
-
-            if (pick.action === 'quick') {
-                const email = await vscode.window.showInputBox({
-                    prompt: 'Masukkan alamat email Google (misal: akun2@gmail.com):',
-                    placeHolder: 'contoh@gmail.com',
-                    validateInput: (v) => (!v || !v.includes('@')) ? 'Masukkan format email yang valid' : null
-                });
-                if (!email) return;
-
-                const name = await vscode.window.showInputBox({
-                    prompt: 'Nama panggilan akun (opsional):',
-                    value: email.split('@')[0]
-                }) || email.split('@')[0];
-
-                const plan = await vscode.window.showQuickPick(['Pro', 'Google AI Plus', 'Ultra', 'Free'], {
-                    placeHolder: 'Pilih paket akun ini:'
-                }) || 'Pro';
-
-                const accounts = getSavedAccounts();
-                if (accounts.some(a => a.email.toLowerCase() === email.toLowerCase())) {
-                    vscode.window.showInformationMessage(`Akun ${email} sudah ada dalam daftar.`);
-                    return;
-                }
-
-                const aPro = isProPlan(plan);
-                accounts.push({
-                    email,
-                    name,
-                    plan,
-                    lastSync: new Date().toISOString(),
-                    quota: {
-                        gemini: {
-                            weekly: { percentage: 100, resetTime: new Date(Date.now() + 6 * 86400000).toISOString() },
-                            fiveHour: aPro ? { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() } : null
-                        },
-                        claude: {
-                            weekly: { percentage: 100, resetTime: new Date(Date.now() + 6 * 86400000).toISOString(), fiveHourLimited: false },
-                            fiveHour: aPro ? { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() } : null
-                        }
-                    }
-                });
-                saveAccounts(accounts);
-                vscode.window.showInformationMessage(`Akun ${email} (${plan}) berhasil ditambahkan ke dropdown!`);
-                dashboardProvider.refresh();
-            } else {
-                const currentEmail = dashboardProvider._latestData?.user?.email || 'Akun Aktif';
-                const opt = await vscode.window.showInformationMessage(
-                    `Hubungkan akun Google baru:\n1. Sesi aktif (${currentEmail}) disimpan aman.\n2. Antigravity akan sign out dan membuka browser.\n3. Setelah login akun baru, ekstensi akan otomatis menyimpannya.`,
-                    'Lanjutkan Sign In', 'Batal'
-                );
-                if (opt === 'Lanjutkan Sign In') {
-                    try {
-                        const rawBlobs = getRawStateBlobs();
-                        if (rawBlobs && dashboardProvider._latestData?.user) {
-                            saveOrUpdateAccount(dashboardProvider._latestData.user, rawBlobs, {
-                                gemini: dashboardProvider._latestData.gemini,
-                                claude: dashboardProvider._latestData.claude
-                            });
-                        }
-                        execSync(`sqlite3 "${STATE_DB}" "DELETE FROM ItemTable WHERE key IN ('antigravityUnifiedStateSync.oauthToken', 'antigravityUnifiedStateSync.userStatus');"`);
-                        vscode.commands.executeCommand('workbench.action.reloadWindow');
-                    } catch (e) {
-                        vscode.window.showErrorMessage(`Gagal memulai login: ${e.message}`);
-                    }
-                }
-            }
         })
     );
 
@@ -570,15 +453,10 @@ class QuotaDashboardProvider {
                     this.refresh(true);
                     break;
                 case 'switchAccount':
-                    try {
-                        switchAccountBlobs(msg.email);
-                        vscode.commands.executeCommand('workbench.action.reloadWindow');
-                    } catch (e) {
-                        vscode.window.showErrorMessage(`Switch failed: ${e.message}`);
-                    }
+                    vscode.commands.executeCommand('agyAccount.switchAccount');
                     break;
                 case 'addAccount':
-                    vscode.commands.executeCommand('agyQuota.addAccount');
+                    vscode.commands.executeCommand('agyAccount.addAccount');
                     break;
                 case 'editAccountQuota': {
                     const targetEmail = msg.email;

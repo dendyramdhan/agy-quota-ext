@@ -1,8 +1,8 @@
 {
   "name": "agy-quota-manager",
-  "displayName": "Antigravity Quota & Accounts",
-  "description": "Live AI model quotas, reset countdown timers, and seamless multi-account management for Antigravity IDE",
-  "version": "3.6.0",
+  "displayName": "Antigravity Quota Monitor",
+  "description": "Live AI model quotas, countdown timers, and gauge indicators for Antigravity IDE",
+  "version": "3.7.0",
   "publisher": "dendy",
   "engines": {
     "vscode": "^1.85.0"
@@ -30,7 +30,7 @@
         {
           "type": "webview",
           "id": "agyQuotaDashboard",
-          "name": "Quota & Accounts"
+          "name": "Live Quota Monitor"
         }
       ]
     },
@@ -43,16 +43,6 @@
       {
         "command": "agyQuota.openDashboard",
         "title": "AGY Quota: Open Dashboard"
-      },
-      {
-        "command": "agyQuota.switchAccount",
-        "title": "AGY Quota: Switch Account",
-        "icon": "$(account)"
-      },
-      {
-        "command": "agyQuota.addAccount",
-        "title": "AGY Quota: Add Google Account",
-        "icon": "$(add)"
       }
     ],
     "menus": {
@@ -61,16 +51,6 @@
           "command": "agyQuota.refresh",
           "when": "view == agyQuotaDashboard",
           "group": "navigation@1"
-        },
-        {
-          "command": "agyQuota.switchAccount",
-          "when": "view == agyQuotaDashboard",
-          "group": "navigation@2"
-        },
-        {
-          "command": "agyQuota.addAccount",
-          "when": "view == agyQuotaDashboard",
-          "group": "navigation@3"
         }
       ]
     }
