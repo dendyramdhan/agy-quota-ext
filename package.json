@@ -2,7 +2,7 @@
   "name": "agy-quota-manager",
   "displayName": "Antigravity Quota & Accounts",
   "description": "Live AI model quotas, reset countdown timers, and seamless multi-account management for Antigravity IDE",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "publisher": "dendy",
   "engines": {
     "vscode": "^1.85.0"

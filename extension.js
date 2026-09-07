@@ -16,6 +16,17 @@ if (!fs.existsSync(CONFIG_DIR)) {
 }
 
 /**
+ * Check whether a plan is Pro or above (has 5-hour limit).
+ * Google AI Plus and Free plans do NOT have 5-hour limits (Weekly limit only).
+ */
+function isProPlan(planStr) {
+    if (!planStr) return false;
+    const p = String(planStr).toLowerCase();
+    if (p.includes('plus') || p.includes('free') || p.includes('starter')) return false;
+    return p.includes('pro') || p.includes('ultra') || p.includes('teams') || p.includes('enterprise');
+}
+
+/**
  * Account Storage Helper
  */
 function getSavedAccounts() {
@@ -23,15 +34,16 @@ function getSavedAccounts() {
         if (fs.existsSync(ACCOUNTS_FILE)) {
             const list = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
             return list.map(a => {
+                const aPro = isProPlan(a.plan);
                 if (!a.quota) {
                     a.quota = {
                         gemini: {
                             weekly: { percentage: 100, resetTime: new Date(Date.now() + 6 * 86400000).toISOString() },
-                            fiveHour: { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() }
+                            fiveHour: aPro ? { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() } : null
                         },
                         claude: {
                             weekly: { percentage: 100, resetTime: new Date(Date.now() + 6 * 86400000).toISOString(), fiveHourLimited: false },
-                            fiveHour: { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() }
+                            fiveHour: aPro ? { percentage: 100, resetTime: new Date(Date.now() + 5 * 3600000).toISOString() } : null
                         }
                     };
                 }
@@ -53,19 +65,21 @@ function saveOrUpdateAccount(accountData, rawTokens, quotaData) {
     const accounts = getSavedAccounts();
     const existingIdx = accounts.findIndex(a => a.email.toLowerCase() === accountData.email.toLowerCase());
     const prev = existingIdx >= 0 ? accounts[existingIdx] : {};
+    const targetPlan = accountData.plan || prev.plan || 'Google AI Plus';
+    const aPro = isProPlan(targetPlan);
     const entry = {
         email: accountData.email,
         name: accountData.name || prev.name || accountData.email.split('@')[0],
-        plan: accountData.plan || prev.plan || 'Pro',
+        plan: targetPlan,
         lastSync: new Date().toISOString(),
         quota: quotaData || prev.quota || {
             gemini: {
                 weekly: { percentage: 100, resetTime: null },
-                fiveHour: { percentage: 100, resetTime: null }
+                fiveHour: aPro ? { percentage: 100, resetTime: null } : null
             },
             claude: {
                 weekly: { percentage: 100, resetTime: null, fiveHourLimited: false },
-                fiveHour: { percentage: 100, resetTime: null }
+                fiveHour: aPro ? { percentage: 100, resetTime: null } : null
             }
         },
         oauthToken: rawTokens?.oauthToken || prev.oauthToken || null,
@@ -259,7 +273,26 @@ function parseStatusResponse(data) {
     const us = data?.userStatus || {};
     const name = us.name || 'User';
     const email = us.email || '';
-    const plan = us.planStatus?.planInfo?.planName || 'Pro';
+    
+    // Accurate plan detection from userTier
+    const tierName = us.userTier?.name || '';
+    const tierDesc = us.userTier?.description || '';
+    let plan = 'Google AI Plus';
+    if (tierName.toLowerCase().includes('plus') || tierDesc.toLowerCase().includes('starter')) {
+        plan = 'Google AI Plus';
+    } else if (tierName.toLowerCase().includes('free') || tierDesc.toLowerCase().includes('free')) {
+        plan = 'Free';
+    } else if (tierName.toLowerCase().includes('ultra')) {
+        plan = 'Google AI Ultra';
+    } else if (tierName.toLowerCase().includes('pro') || us.planStatus?.planInfo?.planName === 'Pro') {
+        if (!tierName.toLowerCase().includes('plus') && !tierDesc.toLowerCase().includes('starter')) {
+            plan = 'Google AI Pro';
+        }
+    } else if (us.planStatus?.planInfo?.planName) {
+        plan = us.planStatus.planInfo.planName;
+    }
+
+    const isPro = isProPlan(plan);
 
     const clientConfigs = us.cascadeModelConfigData?.clientModelConfigs || [];
     const geminiConfigs = clientConfigs.filter(c => (c.label || '').includes('Gemini'));
@@ -283,56 +316,64 @@ function parseStatusResponse(data) {
         return { fraction: minFraction, resetTime };
     }
 
-    // --- 1. GEMINI MODELS ---
     const gPool = getPoolQuota(geminiConfigs);
     const gFraction = gPool.fraction;
-    const gemini5Hour = (typeof gFraction === 'number' && gFraction > 0.005) ? Math.round(gFraction * 100) : 0;
-    const gemini5HourReset = gPool.resetTime || null;
-
-    // Weekly cycle: compute next Sunday 17:30 local time as approximate reset
-    const now = new Date();
-    const dayOfWeek = now.getDay();
-    const daysUntilSunday = (7 - dayOfWeek) % 7 || 7;
-    const weeklyResetDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysUntilSunday, 17, 30, 0);
-    const weeklyResetIso = weeklyResetDate.toISOString();
-
-    // Weekly: estimate from 5-hour fraction. If 5-hour is high, weekly should be at least as high.
-    // Weekly degrades slower than 5-hour. Approximate: weekly ≈ max(5h%, estimated_weekly).
-    // Since LS doesn't provide weekly data, we estimate conservatively.
-    const geminiWeekly = gemini5Hour === 0 ? Math.max(0, 65) : Math.max(gemini5Hour, Math.min(100, gemini5Hour + 10));
-
-    // --- 2. CLAUDE AND GPT MODELS ---
     const cPool = getPoolQuota(claudeConfigs);
     const cFraction = cPool.fraction;
-    // When remainingFraction is <= 0.005 or null, the 5-hour limit is hit (0%)
-    const claude5Hour = (typeof cFraction === 'number' && cFraction > 0.005) ? Math.round(cFraction * 100) : 0;
-    const claude5HourReset = cPool.resetTime || null;
 
-    // Weekly limit for Claude: estimate similarly
-    const claudeWeekly = claude5Hour === 0 ? 65 : Math.max(claude5Hour, Math.min(100, claude5Hour + 10));
+    let geminiWeekly, geminiWeeklyReset, gemini5Hour, gemini5HourReset;
+    let claudeWeekly, claudeWeeklyReset, claude5Hour, claude5HourReset;
+
+    if (!isPro) {
+        // Google AI Plus / Free: Antigravity ONLY has Weekly Limit Remaining!
+        // The Language Server quotaInfo (fraction & resetTime) is the official Weekly Limit.
+        geminiWeekly = (typeof gFraction === 'number' && gFraction > 0.005) ? Math.round(gFraction * 100) : 0;
+        geminiWeeklyReset = gPool.resetTime || null;
+        gemini5Hour = null;
+        gemini5HourReset = null;
+
+        claudeWeekly = (typeof cFraction === 'number' && cFraction > 0.005) ? Math.round(cFraction * 100) : 0;
+        claudeWeeklyReset = cPool.resetTime || null;
+        claude5Hour = null;
+        claude5HourReset = null;
+    } else {
+        // Pro / Ultra: Has both 5-Hour rolling limit and Weekly cap
+        gemini5Hour = (typeof gFraction === 'number' && gFraction > 0.005) ? Math.round(gFraction * 100) : 0;
+        gemini5HourReset = gPool.resetTime || null;
+        const now = new Date();
+        const daysUntilSunday = (7 - now.getDay()) % 7 || 7;
+        const weeklyResetIso = new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysUntilSunday, 17, 30, 0).toISOString();
+        geminiWeekly = gemini5Hour === 0 ? Math.max(0, 65) : Math.max(gemini5Hour, Math.min(100, gemini5Hour + 10));
+        geminiWeeklyReset = weeklyResetIso;
+
+        claude5Hour = (typeof cFraction === 'number' && cFraction > 0.005) ? Math.round(cFraction * 100) : 0;
+        claude5HourReset = cPool.resetTime || null;
+        claudeWeekly = claude5Hour === 0 ? 65 : Math.max(claude5Hour, Math.min(100, claude5Hour + 10));
+        claudeWeeklyReset = weeklyResetIso;
+    }
 
     return {
-        user: { name, email, plan },
+        user: { name, email, plan, isPro, tierDesc },
         gemini: {
             weekly: {
                 percentage: geminiWeekly,
-                resetTime: weeklyResetIso
+                resetTime: geminiWeeklyReset
             },
-            fiveHour: {
+            fiveHour: gemini5Hour !== null ? {
                 percentage: gemini5Hour,
                 resetTime: gemini5HourReset
-            }
+            } : null
         },
         claude: {
             weekly: {
                 percentage: claudeWeekly,
-                resetTime: weeklyResetIso,
-                fiveHourLimited: claude5Hour === 0
+                resetTime: claudeWeeklyReset,
+                fiveHourLimited: isPro && claude5Hour === 0
             },
-            fiveHour: {
+            fiveHour: claude5Hour !== null ? {
                 percentage: claude5Hour,
                 resetTime: claude5HourReset
-            }
+            } : null
         },
         timestamp: new Date().toISOString()
     };
@@ -544,15 +585,30 @@ class QuotaDashboardProvider {
                     const acc = accounts.find(a => a.email.toLowerCase() === targetEmail.toLowerCase());
                     if (!acc) return;
 
+                    const aPro = isProPlan(acc.plan);
+                    const promptG = aPro
+                        ? `Persentase Kuota Gemini 5-Jam untuk ${acc.email} (0 - 100):`
+                        : `Persentase Kuota Gemini Weekly untuk ${acc.email} (0 - 100):`;
+                    const promptC = aPro
+                        ? `Persentase Kuota Claude/GPT 5-Jam untuk ${acc.email} (0 - 100):`
+                        : `Persentase Kuota Claude/GPT Weekly untuk ${acc.email} (0 - 100):`;
+
+                    const currG = aPro
+                        ? (acc.quota?.gemini?.fiveHour?.percentage ?? acc.quota?.gemini?.weekly?.percentage ?? 100)
+                        : (acc.quota?.gemini?.weekly?.percentage ?? 100);
+                    const currC = aPro
+                        ? (acc.quota?.claude?.fiveHour?.percentage ?? acc.quota?.claude?.weekly?.percentage ?? 100)
+                        : (acc.quota?.claude?.weekly?.percentage ?? 100);
+
                     const gInput = await vscode.window.showInputBox({
-                        prompt: `Persentase Kuota Gemini 5-Jam untuk ${acc.email} (0 - 100):`,
-                        value: String(acc.quota?.gemini?.fiveHour?.percentage ?? 100)
+                        prompt: promptG,
+                        value: String(currG)
                     });
                     if (gInput === undefined) return;
 
                     const cInput = await vscode.window.showInputBox({
-                        prompt: `Persentase Kuota Claude/GPT 5-Jam untuk ${acc.email} (0 - 100):`,
-                        value: String(acc.quota?.claude?.fiveHour?.percentage ?? 100)
+                        prompt: promptC,
+                        value: String(currC)
                     });
                     if (cInput === undefined) return;
 
@@ -561,28 +617,36 @@ class QuotaDashboardProvider {
 
                     acc.quota = acc.quota || {};
                     acc.quota.gemini = acc.quota.gemini || {};
-                    acc.quota.gemini.fiveHour = {
+                    acc.quota.gemini.weekly = {
                         percentage: gVal,
-                        resetTime: new Date(Date.now() + 5 * 3600000).toISOString()
+                        resetTime: acc.quota.gemini.weekly?.resetTime || new Date(Date.now() + 6 * 86400000).toISOString()
                     };
-                    acc.quota.gemini.weekly = acc.quota.gemini.weekly || {
-                        percentage: Math.max(gVal, 90),
-                        resetTime: new Date(Date.now() + 6 * 86400000).toISOString()
-                    };
+                    if (aPro) {
+                        acc.quota.gemini.fiveHour = {
+                            percentage: gVal,
+                            resetTime: new Date(Date.now() + 5 * 3600000).toISOString()
+                        };
+                    } else {
+                        acc.quota.gemini.fiveHour = null;
+                    }
 
                     acc.quota.claude = acc.quota.claude || {};
-                    acc.quota.claude.fiveHour = {
+                    acc.quota.claude.weekly = {
                         percentage: cVal,
-                        resetTime: new Date(Date.now() + 5 * 3600000).toISOString()
+                        resetTime: acc.quota.claude.weekly?.resetTime || new Date(Date.now() + 6 * 86400000).toISOString(),
+                        fiveHourLimited: aPro && cVal === 0
                     };
-                    acc.quota.claude.weekly = acc.quota.claude.weekly || {
-                        percentage: cVal === 0 ? 65 : Math.max(cVal, 80),
-                        resetTime: new Date(Date.now() + 6 * 86400000).toISOString(),
-                        fiveHourLimited: cVal === 0
-                    };
+                    if (aPro) {
+                        acc.quota.claude.fiveHour = {
+                            percentage: cVal,
+                            resetTime: new Date(Date.now() + 5 * 3600000).toISOString()
+                        };
+                    } else {
+                        acc.quota.claude.fiveHour = null;
+                    }
 
                     saveAccounts(accounts);
-                    vscode.window.showInformationMessage(`Kuota untuk ${acc.email} berhasil diperbarui!`);
+                    vscode.window.showInformationMessage(`Kuota untuk ${acc.email} (${acc.plan || 'Plus'}) berhasil diperbarui!`);
                     this._pushUpdate();
                     break;
                 }
@@ -643,7 +707,10 @@ class QuotaDashboardProvider {
 
     _updateStatusBar() {
         if (!statusBarItem || !this._latestData || !this._latestData.user) return;
-        const gPct = this._latestData.gemini?.fiveHour?.percentage ?? 100;
+        const isPro = isProPlan(this._latestData.user.plan);
+        const gPct = isPro
+            ? (this._latestData.gemini?.fiveHour?.percentage ?? this._latestData.gemini?.weekly?.percentage ?? 100)
+            : (this._latestData.gemini?.weekly?.percentage ?? 100);
         const email = this._latestData.user.email || '';
         const shortEmail = email.split('@')[0];
 
@@ -652,7 +719,8 @@ class QuotaDashboardProvider {
         else if (gPct < 50) icon = '$(warning)';
 
         statusBarItem.text = `${icon} AGY: ${gPct}% (${shortEmail})`;
-        statusBarItem.tooltip = `Antigravity Quota\nAccount: ${email}\nGemini 5-Hour: ${gPct}%\nClick to open dashboard`;
+        const qLabel = isPro ? 'Gemini 5-Hour' : 'Gemini Weekly';
+        statusBarItem.tooltip = `Antigravity Quota\nAccount: ${email} (${this._latestData.user.plan || 'Plus'})\n${qLabel}: ${gPct}%\nClick to open dashboard`;
     }
 
     _pushUpdate() {
@@ -1236,7 +1304,7 @@ class QuotaDashboardProvider {
                 <span class="info-tag">Gemini 3.6 Flash</span>
             </div>
             <div class="info-details-note">
-                💡 <strong>Siklus Reset:</strong> Limit 5-jam tersegarkan setiap 5 jam dari kueri awal. Kuota mingguan (Weekly) menyegarkan kuota total 7 hari rolling.
+                💡 <strong>Siklus Reset:</strong> Paket Google AI Plus & Free memiliki jatah <strong>Weekly Limit</strong> (reset 7 hari). Limit 5-Jam bergulir hanya berlaku untuk paket Pro/Ultra.
             </div>
         </div>
         <div class="quota-card">
@@ -1260,10 +1328,10 @@ class QuotaDashboardProvider {
                 </div>
             </div>
 
-            <div class="quota-divider"></div>
+            <div class="quota-divider" id="geminiDivider"></div>
 
-            <!-- Five Hour Limit -->
-            <div class="quota-row">
+            <!-- Five Hour Limit (Pro only) -->
+            <div class="quota-row" id="gemini5HourRow">
                 <div class="quota-text-col">
                     <div class="limit-title">Five Hour Limit Remaining</div>
                     <div class="limit-desc" id="gemini5HourDesc">Loading 5-hour limit...</div>
@@ -1300,7 +1368,7 @@ class QuotaDashboardProvider {
                 <span class="info-tag">GPT-OSS 120B (Medium)</span>
             </div>
             <div class="info-details-note">
-                ⚠️ <strong>Status Saat Ini:</strong> Limit 5 jam <strong>HABIS (0%)</strong>. Permintaan dijeda hingga waktu reset atau menggunakan AI Credits jika berlangganan paket berbayar. Kuota mingguan (65%) dipause selama limit 5 jam aktif.
+                💡 <strong>Siklus Reset:</strong> Di paket Google AI Plus & Free berlaku <strong>Weekly Limit</strong>. Di paket Pro berlaku 5-Hour limit serta Weekly Limit. Jika habis (0%), aktifkan AI Credits atau tunggu waktu reset.
             </div>
         </div>
         <div class="quota-card">
@@ -1324,10 +1392,10 @@ class QuotaDashboardProvider {
                 </div>
             </div>
 
-            <div class="quota-divider"></div>
+            <div class="quota-divider" id="claudeDivider"></div>
 
-            <!-- Five Hour Limit -->
-            <div class="quota-row">
+            <!-- Five Hour Limit (Pro only) -->
+            <div class="quota-row" id="claude5HourRow">
                 <div class="quota-text-col">
                     <div class="limit-title">Five Hour Limit Remaining</div>
                     <div class="limit-desc" id="claude5HourDesc">Loading 5-hour limit...</div>
@@ -1490,15 +1558,25 @@ class QuotaDashboardProvider {
             var a = savedAccountsList[i];
             var isIdeActive = a.email.toLowerCase() === activeIdeAccount.toLowerCase();
             var isSelected = a.email.toLowerCase() === (selectedEmail || '').toLowerCase();
+            var aPro = isProPlan(a.plan);
 
             var gPct = 100;
             var cPct = 100;
             if (isIdeActive && currentData) {
-                gPct = currentData.gemini && currentData.gemini.fiveHour && typeof currentData.gemini.fiveHour.percentage === 'number' ? currentData.gemini.fiveHour.percentage : 53;
-                cPct = currentData.claude && currentData.claude.fiveHour && typeof currentData.claude.fiveHour.percentage === 'number' ? currentData.claude.fiveHour.percentage : 0;
+                var isCurPro = isProPlan(currentData.user && currentData.user.plan);
+                gPct = isCurPro
+                    ? (currentData.gemini?.fiveHour?.percentage ?? currentData.gemini?.weekly?.percentage ?? 100)
+                    : (currentData.gemini?.weekly?.percentage ?? 100);
+                cPct = isCurPro
+                    ? (currentData.claude?.fiveHour?.percentage ?? currentData.claude?.weekly?.percentage ?? 0)
+                    : (currentData.claude?.weekly?.percentage ?? 0);
             } else if (a.quota) {
-                gPct = a.quota.gemini && a.quota.gemini.fiveHour && typeof a.quota.gemini.fiveHour.percentage === 'number' ? a.quota.gemini.fiveHour.percentage : 100;
-                cPct = a.quota.claude && a.quota.claude.fiveHour && typeof a.quota.claude.fiveHour.percentage === 'number' ? a.quota.claude.fiveHour.percentage : 100;
+                gPct = aPro
+                    ? (a.quota.gemini?.fiveHour?.percentage ?? a.quota.gemini?.weekly?.percentage ?? 100)
+                    : (a.quota.gemini?.weekly?.percentage ?? 100);
+                cPct = aPro
+                    ? (a.quota.claude?.fiveHour?.percentage ?? a.quota.claude?.weekly?.percentage ?? 100)
+                    : (a.quota.claude?.weekly?.percentage ?? 100);
             }
 
             var initial = (a.name || a.email).charAt(0).toUpperCase();
@@ -1513,7 +1591,7 @@ class QuotaDashboardProvider {
             html +=       '</div>';
             html +=     '</div>';
             html +=     '<div style="display:flex; align-items:center; gap:5px;">';
-            html +=       '<span class="mini-plan">' + (a.plan || 'Pro') + '</span>';
+            html +=       '<span class="mini-plan">' + (a.plan || 'Plus') + '</span>';
             if (isIdeActive) {
                 html +=   '<span class="mini-active-pill">★ Aktif di IDE</span>';
             } else {
@@ -1542,6 +1620,13 @@ class QuotaDashboardProvider {
         container.innerHTML = html;
     }
 
+    function isProPlan(planStr) {
+        if (!planStr) return false;
+        var p = String(planStr).toLowerCase();
+        if (p.includes('plus') || p.includes('free') || p.includes('starter')) return false;
+        return p.includes('pro') || p.includes('ultra') || p.includes('teams') || p.includes('enterprise');
+    }
+
     function renderSelectedAccountDetails() {
         if (!selectedEmail) return;
         var isIdeActive = selectedEmail.toLowerCase() === activeIdeAccount.toLowerCase();
@@ -1554,8 +1639,19 @@ class QuotaDashboardProvider {
             return a.email.toLowerCase() === selectedEmail.toLowerCase();
         });
 
-        var planName = (targetAcc && targetAcc.plan) || (currentData && currentData.user && currentData.user.plan) || 'PRO';
+        var planName = (targetAcc && targetAcc.plan) || (currentData && currentData.user && currentData.user.plan) || 'Google AI Plus';
+        var isPro = isProPlan(planName);
         if (planBadge) planBadge.textContent = planName.toUpperCase();
+
+        var g5Row = document.getElementById('gemini5HourRow');
+        var gDiv = document.getElementById('geminiDivider');
+        var c5Row = document.getElementById('claude5HourRow');
+        var cDiv = document.getElementById('claudeDivider');
+
+        if (g5Row) g5Row.style.display = isPro ? 'flex' : 'none';
+        if (gDiv) gDiv.style.display = isPro ? 'block' : 'none';
+        if (c5Row) c5Row.style.display = isPro ? 'flex' : 'none';
+        if (cDiv) cDiv.style.display = isPro ? 'block' : 'none';
 
         if (isIdeActive) {
             if (banner) {
@@ -1592,11 +1688,11 @@ class QuotaDashboardProvider {
                 },
                 gemini: {
                     weekly: { percentage: gWeekPct, resetTime: gWeekReset },
-                    fiveHour: { percentage: g5Pct, resetTime: g5Reset }
+                    fiveHour: isPro ? { percentage: g5Pct, resetTime: g5Reset } : null
                 },
                 claude: {
-                    weekly: { percentage: cWeekPct, resetTime: cWeekReset, fiveHourLimited: c5Pct === 0 },
-                    fiveHour: { percentage: c5Pct, resetTime: c5Reset }
+                    weekly: { percentage: cWeekPct, resetTime: cWeekReset, fiveHourLimited: isPro && c5Pct === 0 },
+                    fiveHour: isPro ? { percentage: c5Pct, resetTime: c5Reset } : null
                 }
             };
         }
@@ -1609,26 +1705,36 @@ class QuotaDashboardProvider {
     function updateTick() {
         if (!currentDisplayData) return;
         var now = Date.now();
+        var isPro = isProPlan(currentDisplayData.user && currentDisplayData.user.plan);
 
         // 1. Gemini Weekly
         var gwReset = currentDisplayData.gemini && currentDisplayData.gemini.weekly && currentDisplayData.gemini.weekly.resetTime ? new Date(currentDisplayData.gemini.weekly.resetTime).getTime() : 0;
         var gwDiff = Math.max(0, gwReset - now);
         var gwPct = currentDisplayData.gemini && currentDisplayData.gemini.weekly && typeof currentDisplayData.gemini.weekly.percentage === 'number' ? currentDisplayData.gemini.weekly.percentage : 100;
-        document.getElementById('geminiWeeklyDesc').textContent = 'You have used some of your weekly limit, it will fully refresh in ' + formatDuration(gwDiff) + '.';
+        
+        if (gwPct >= 100) {
+            document.getElementById('geminiWeeklyDesc').textContent = 'You have not used any of your weekly limit.';
+        } else if (gwPct <= 0) {
+            document.getElementById('geminiWeeklyDesc').textContent = 'You have hit your weekly limit, it refreshes in ' + formatDuration(gwDiff) + '.';
+        } else {
+            document.getElementById('geminiWeeklyDesc').textContent = 'You have used some of your weekly limit, it will fully refresh in ' + formatDuration(gwDiff) + '.';
+        }
         document.getElementById('geminiWeeklyExactTime').textContent = formatExactDate(gwReset);
         setCircle('geminiWeeklyCircle', gwPct, 'geminiWeeklyPct');
 
-        // 2. Gemini 5-Hour
-        var g5Reset = currentDisplayData.gemini && currentDisplayData.gemini.fiveHour && currentDisplayData.gemini.fiveHour.resetTime ? new Date(currentDisplayData.gemini.fiveHour.resetTime).getTime() : 0;
-        var g5Diff = Math.max(0, g5Reset - now);
-        var g5Pct = currentDisplayData.gemini && currentDisplayData.gemini.fiveHour && typeof currentDisplayData.gemini.fiveHour.percentage === 'number' ? currentDisplayData.gemini.fiveHour.percentage : 100;
-        if (g5Pct <= 0) {
-            document.getElementById('gemini5HourDesc').textContent = 'You have hit your 5-hour limit, it will refresh in ' + formatDuration(g5Diff) + '.';
-        } else {
-            document.getElementById('gemini5HourDesc').textContent = 'You have used some of your 5-hour limit, it will fully refresh in ' + formatDuration(g5Diff) + '.';
+        // 2. Gemini 5-Hour (Only if Pro)
+        if (isPro && currentDisplayData.gemini && currentDisplayData.gemini.fiveHour) {
+            var g5Reset = currentDisplayData.gemini.fiveHour.resetTime ? new Date(currentDisplayData.gemini.fiveHour.resetTime).getTime() : 0;
+            var g5Diff = Math.max(0, g5Reset - now);
+            var g5Pct = typeof currentDisplayData.gemini.fiveHour.percentage === 'number' ? currentDisplayData.gemini.fiveHour.percentage : 100;
+            if (g5Pct <= 0) {
+                document.getElementById('gemini5HourDesc').textContent = 'You have hit your 5-hour limit, it will refresh in ' + formatDuration(g5Diff) + '.';
+            } else {
+                document.getElementById('gemini5HourDesc').textContent = 'You have used some of your 5-hour limit, it will fully refresh in ' + formatDuration(g5Diff) + '.';
+            }
+            document.getElementById('gemini5HourExactTime').textContent = formatExactDate(g5Reset);
+            setCircle('gemini5HourCircle', g5Pct, 'gemini5HourPct');
         }
-        document.getElementById('gemini5HourExactTime').textContent = formatExactDate(g5Reset);
-        setCircle('gemini5HourCircle', g5Pct, 'gemini5HourPct');
 
         // 3. Claude Weekly
         var cwReset = currentDisplayData.claude && currentDisplayData.claude.weekly && currentDisplayData.claude.weekly.resetTime ? new Date(currentDisplayData.claude.weekly.resetTime).getTime() : 0;
@@ -1637,23 +1743,29 @@ class QuotaDashboardProvider {
         var c5Reset = currentDisplayData.claude && currentDisplayData.claude.fiveHour && currentDisplayData.claude.fiveHour.resetTime ? new Date(currentDisplayData.claude.fiveHour.resetTime).getTime() : 0;
         var c5Diff = Math.max(0, c5Reset - now);
 
-        if (currentDisplayData.claude && currentDisplayData.claude.weekly && currentDisplayData.claude.weekly.fiveHourLimited) {
+        if (isPro && currentDisplayData.claude && currentDisplayData.claude.weekly && currentDisplayData.claude.weekly.fiveHourLimited) {
             document.getElementById('claudeWeeklyDesc').textContent = 'You have hit your 5-hour limit, so the weekly limit does not currently apply. Your 5-hour limit will refresh in ' + formatDuration(c5Diff) + '.';
+        } else if (cwPct <= 0) {
+            document.getElementById('claudeWeeklyDesc').textContent = 'You have hit your weekly limit, it refreshes in ' + formatDuration(cwDiff) + '. If on a supported paid plan, you can use AI credits in the interim or upgrade to a higher tier.';
+        } else if (cwPct >= 100) {
+            document.getElementById('claudeWeeklyDesc').textContent = 'You have not used any of your weekly limit.';
         } else {
             document.getElementById('claudeWeeklyDesc').textContent = 'You have used some of your weekly limit, it will fully refresh in ' + formatDuration(cwDiff) + '.';
         }
         document.getElementById('claudeWeeklyExactTime').textContent = formatExactDate(cwReset);
         setCircle('claudeWeeklyCircle', cwPct, 'claudeWeeklyPct');
 
-        // 4. Claude 5-Hour
-        var c5Pct = currentDisplayData.claude && currentDisplayData.claude.fiveHour && typeof currentDisplayData.claude.fiveHour.percentage === 'number' ? currentDisplayData.claude.fiveHour.percentage : 100;
-        if (c5Pct <= 0) {
-            document.getElementById('claude5HourDesc').textContent = 'You have hit your 5-hour limit, it will refresh in ' + formatDuration(c5Diff) + '. If on a supported paid plan, you can use AI credits in the interim.';
-        } else {
-            document.getElementById('claude5HourDesc').textContent = 'You have used some of your 5-hour limit, it will fully refresh in ' + formatDuration(c5Diff) + '.';
+        // 4. Claude 5-Hour (Only if Pro)
+        if (isPro && currentDisplayData.claude && currentDisplayData.claude.fiveHour) {
+            var c5Pct = typeof currentDisplayData.claude.fiveHour.percentage === 'number' ? currentDisplayData.claude.fiveHour.percentage : 100;
+            if (c5Pct <= 0) {
+                document.getElementById('claude5HourDesc').textContent = 'You have hit your 5-hour limit, it will refresh in ' + formatDuration(c5Diff) + '. If on a supported paid plan, you can use AI credits in the interim.';
+            } else {
+                document.getElementById('claude5HourDesc').textContent = 'You have used some of your 5-hour limit, it will fully refresh in ' + formatDuration(c5Diff) + '.';
+            }
+            document.getElementById('claude5HourExactTime').textContent = formatExactDate(c5Reset);
+            setCircle('claude5HourCircle', c5Pct, 'claude5HourPct');
         }
-        document.getElementById('claude5HourExactTime').textContent = formatExactDate(c5Reset);
-        setCircle('claude5HourCircle', c5Pct, 'claude5HourPct');
     }
 
     function renderUI(data, accounts, activeIdeEmail) {
